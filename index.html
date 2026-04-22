@@ -1,0 +1,250 @@
+        from: message.from,
+        peerId: message.peerId,
+        format: message.format,
+        team: message.team,
+      };
+      state.online.format = message.format;
+      pushNotice(`Reto directo recibido de ${message.from}.`, "success");
+      render();
+      break;
+    case "challenge-response":
+      if (!message.accepted) {
+        state.online.challengeStatus = `${message.responder} rechazÃ³ el reto.`;
+        render();
+        return;
+      }
+      if (!runtime.peerConnection) {
+        return;
+      }
+      const initPayload = createBattlePayload({
+        format: state.online.format,
+        localName: getActiveAccount().nickname,
+        remoteName: message.responder,
+        localTeam: clonePlayableTeam(getSelectedTeam()),
+        remoteTeam: message.team,
+        mode: "online",
+        role: "host",
+      });
+      runtime.peerConnection.send({
+        type: "battle-init",
+        battle: initPayload.serialized,
+      });
+      loadBattle(initPayload.serialized, "host");
+      render();
+      break;
+    case "match-connect": {
+      const localTeam = clonePlayableTeam(getSelectedTeam());
+      const initPayload = createBattlePayload({
+        format: message.format,
+        localName: getActiveAccount().nickname,
+        remoteName: message.challenger,
+        localTeam,
+        remoteTeam: message.team,
+        mode: "online",
+        role: "host",
+      });
+      connection.send({
+        type: "battle-init",
+        battle: initPayload.serialized,
+      });
+      loadBattle(initPayload.serialized, "host");
+      render();
+      break;
+    }
+    case "battle-init":
+      loadBattle(message.battle, "guest");
+      render();
+      break;
+    case "lead-choice":
+      if (!state.battle || state.battle.mode !== "online") {
+        return;
+      }
+      state.battle.pendingRemoteLead = message.index;
+      maybeResolveLeadPhase();
+      break;
+    case "battle-action":
+      if (!state.battle || state.battle.mode !== "online" || state.battle.role !== "host") {
+        return;
+      }
+      state.battle.pendingRemoteAction = message.action;
+      maybeResolveHostedTurn();
+      break;
+    case "battle-snapshot":
+      if (!state.battle || state.battle.role !== "guest") {
+        return;
+      }
+      applyBattleSnapshot(message.snapshot);
+      break;
+    case "battle-result":
+      if (!state.battle) {
+        return;
+      }
+      applyBattleSnapshot(message.snapshot);
+      finishBattleFromSnapshot();
+      break;
+    case "battle-forfeit":
+      if (!state.battle) {
+        return;
+      }
+      forceBattleWinner(message.winner, message.reason || "forfeit");
+      break;
+    default:
+      break;
+  }
+}
+
+function startPracticeBattle() {
+  const team = getSelectedTeam();
+  if (!team) {
+    pushNotice("Selecciona un equipo antes de iniciar prÃ¡ctica.", "warning");
+    return;
+  }
+  const validation = validateTeam(team);
+  if (!validation.ok) {
+    pushNotice(validation.issues[0], "error");
+    return;
+  }
+  const remoteTeam = buildBotTeam(team.format);
+  const payload = createBattlePayload({
+    format: team.format,
+    localName: getActiveAccount().nickname,
+    remoteName: PRACTICE_BOT_NAME,
+    localTeam: clonePlayableTeam(team),
+    remoteTeam,
+    mode: "practice",
+    role: "host",
+  });
+  loadBattle(payload.serialized, "host");
+  state.screen = "battle";
+  pushNotice("PrÃ¡ctica iniciada.", "success");
+  render();
+}
+
+function buildBotTeam(formatId) {
+  const presets = DATA.presets.filter((preset) => preset.format === formatId);
+  return {
+    id: randomId("botteam"),
+    name: `${DATA.formatMap[formatId].name} Bot`,
+    format: formatId,
+    sets: presets.slice(0, 3).map((preset) => createSetFromPreset(preset)),
+  };
+}
+
+function createBattlePayload({ format, localName, remoteName, localTeam, remoteTeam, mode, role }) {
+  const serialized = {
+    id: randomId("battle"),
+    format,
+    mode,
+    role,
+    phase: "preview",
+    turn: 1,
+    pendingTeraSide: null,
+    log: [`${localName} vs ${remoteName}`],
+    players: [
+      makeBattlePlayer(localName, localTeam, true, format),
+      makeBattlePlayer(remoteName, remoteTeam, false, format),
+    ],
+    active: [null, null],
+    requestSide: 0,
+    waitingForLead: [false, false],
+    pendingActions: [null, null],
+    pendingRemoteLead: null,
+    pendingRemoteAction: null,
+    finished: false,
+    winner: null,
+  };
+  serialized.waitingForLead = [true, true];
+  return { serialized };
+}
+
+function loadBattle(serialized, role) {
+  state.battle = {
+    ...structuredClone(serialized),
+    role,
+    localSide: role === "guest" ? 1 : 0,
+    finished: serialized.finished || false,
+    pendingLocalTera: false,
+    pendingRemoteLead: null,
+    pendingRemoteAction: null,
+  };
+  runtime.resolvedLeadPick = false;
+  state.screen = "battle";
+  render();
+}
+
+function makeBattlePlayer(name, team, isLocalSide, formatId) {
+  return {
+    name,
+    isLocalSide,
+    teraUsed: false,
+    hazards: { stealthrock: 0, spikes: 0 },
+    party: team.sets.map((set, index) => createBattleMon(set, index, formatId)),
+  };
+}
+
+function createBattleMon(set, slotIndex, formatId) {
+  const species = DATA.speciesMap[toId(set.species)];
+  const level = clampNumber(set.level || 100, 1, 100);
+  const stats = calculateStats(species, set, level);
+  return {
+    slot: slotIndex,
+    nickname: set.nickname || set.species,
+    species: set.species,
+    speciesId: toId(set.species),
+    item: set.item || "",
+    ability: set.ability || "",
+    level,
+    gender: set.gender || "",
+    shiny: !!set.shiny,
+    teraType: formatId === "gen9ou" ? set.teraType || (species && species.types[0]) || "Normal" : "",
+    types: species ? species.types.slice() : ["Normal"],
+    originalTypes: species ? species.types.slice() : ["Normal"],
+    currentTypes: species ? species.types.slice() : ["Normal"],
+    stats,
+    currentHp: stats.hp,
+    status: "",
+    boosts: { atk: 0, def: 0, spa: 0, spd: 0, spe: 0 },
+    volatile: { protect: false, taunt: 0, saltCure: false },
+    moves: set.moves
+      .filter(Boolean)
+      .slice(0, 4)
+      .map((moveName) => {
+        const moveData = DATA.moveMap[toId(moveName)] || { pp: 10 };
+        return {
+          name: moveName,
+          id: toId(moveName),
+          pp: moveData.pp || 10,
+          maxpp: moveData.pp || 10,
+        };
+      }),
+    fainted: false,
+    terastallized: false,
+  };
+}
+
+function chooseLead(index) {
+  if (!state.battle || state.battle.phase !== "preview" || state.battle.finished) {
+    return;
+  }
+  const side = state.battle.localSide;
+  state.battle.active[side] = index;
+  state.battle.waitingForLead[side] = false;
+  if (state.battle.mode === "online") {
+    if (state.battle.role === "guest") {
+      runtime.peerConnection &&
+        runtime.peerConnection.send({ type: "lead-choice", index });
+    } else {
+      maybeResolveLeadPhase();
+    }
+  } else {
+    const enemyIndex = choosePracticeLead();
+    state.battle.active[1] = enemyIndex;
+    state.battle.waitingForLead[1] = false;
+    maybeResolveLeadPhase();
+  }
+  render();
+}
+
+function choosePracticeLead() {
+  return 0;
+}
